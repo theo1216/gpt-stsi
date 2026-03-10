@@ -5,10 +5,7 @@ from typing import Optional, Dict, List
 
 import requests
 import streamlit as st
-from dotenv import load_dotenv
 from pypdf import PdfReader
-
-load_dotenv()
 
 API_KEY = os.getenv("ANTHROPIC_API_KEY")
 API_URL = "https://api.anthropic.com/v1/messages"
@@ -509,4 +506,5 @@ if st.session_state.generated_text:
         data=st.session_state.generated_text.encode("utf-8"),
         file_name="proposal_output.txt",
         mime="text/plain",
+
     )

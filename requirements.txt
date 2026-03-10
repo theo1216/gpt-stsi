@@ -1,2 +1,3 @@
-streamlitstreamlit
-requests
+anthropic==0.49.0
+streamlit==1.44.0
+pypdf==4.3.1

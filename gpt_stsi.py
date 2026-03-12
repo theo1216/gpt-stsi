@@ -1,582 +1,370 @@
-import os
-import base64
-from typing import Optional, Dict, List, Any
+import json
+import re
+from collections import Counter
+from io import BytesIO
 
-import requests
 import streamlit as st
+from pypdf import PdfReader
 
-API_URL = "https://api.anthropic.com/v1/messages"
-DEFAULT_MODEL = "claude-sonnet-4-6"
+st.set_page_config(page_title="RFP AI 분석 도우미", page_icon="🔍", layout="wide")
 
-SYSTEM_PROMPT = """당신은 대한민국 정부출연연구기관(STSI) 전문 제안서 작성자입니다.
-아래 STSI 과제수주 전략을 완전히 내재화하여 모든 제안서를 작성하십시오.
+st.markdown(
+    """
+    <style>
+    .block-container {max-width: 1180px; padding-top: 1.8rem; padding-bottom: 3rem;}
+    .hero {padding: 26px 30px; border-radius: 18px; background: linear-gradient(135deg,#eef4ff,#f8fbff); border: 1px solid #dbeafe; margin-bottom: 1rem;}
+    .hero-badge {display:inline-block; padding:6px 14px; border-radius:999px; background:linear-gradient(135deg,#1a4f8a,#2563c4); color:#fff; font-size:12px; font-weight:700;}
+    .chip {display:inline-block; margin:4px 6px 4px 0; padding:6px 12px; border-radius:999px; color:#fff; font-size:12px; font-weight:700;}
+    .soft {background:#f8fbff; border-left:4px solid #2563c4; padding:14px 16px; border-radius:10px;}
+    .warn {background:#fffbeb; border-left:4px solid #f59e0b; padding:14px 16px; border-radius:10px;}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-## 1. 공고 해석 원칙: 발주 의도 역설계
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-- 요구사항 해석(X) → 발주 의도 역설계(O)
-- 핵심 질문: "왜 지금 이 과제를 내는가? 발주자의 고민은 무엇인가?"
-- 모든 서술은 발주자의 고민 해결을 중심으로 구성
+TAG_COLORS = ["#1a4f8a","#2563c4","#0369a1","#0e7490","#047857","#6d28d9","#7c3aed","#b45309","#be185d","#c2410c"]
+STOPWORDS = {
+    "그리고","그러나","또한","위한","통한","대한","관련","기반","분석","연구","과제","사업","수행","추진",
+    "제안","계획","방안","자료","문서","추가","직접","입력","활용","검토","지원","개선","도출","구축","개발",
+    "정부","국가","한국","대한민국","분야","중심","내용","목표","필요","현재","향후","이번","이상","아래",
+    "the","and","for","with","from","that","this","into","using","based"
+}
+DOMAIN_HINTS = {
+    "ai_data": ["ai","인공지능","데이터","플랫폼","알고리즘","모델","디지털","llm"],
+    "policy": ["정책","평가","성과","거버넌스","전략","제도","로드맵","기획"],
+    "bio_health": ["바이오","의료","헬스","진단","유전체","약물","질환"],
+    "climate_energy": ["탄소","에너지","기후","환경","전력","배터리","수소"],
+    "manufacturing": ["제조","공정","소재","부품","장비","로봇","자동화"],
+}
+FOCUS = {
+    "ai_data": "디지털 전환과 데이터 기반 의사결정 체계의 실효성",
+    "policy": "정책 실행력과 성과관리 체계의 정합성",
+    "bio_health": "실증 가능성과 공공적 파급효과",
+    "climate_energy": "탄소중립 대응과 실증 확산 가능성",
+    "manufacturing": "현장 적용성과 공정 혁신 가능성",
+    "general": "정책적 필요성과 실행 가능성",
+}
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-## 2. STSI 제안서 구조: 병목 중심 서술
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-- 일반(현황→문제→방안) 구조 금지
-- STSI 구조: 구조 진단(병목) → 정책 리스크 분석 → 실행가능성 시뮬레이션
-- 병목(Bottleneck) = 목표 달성 흐름을 실제로 막는 제약의 집합
-  * 원인-결과 연결(왜 막히는가)
-  * 대체 경로 부재(한 지점이 막히면 전체 정지)
-  * 소요기간 폭증(승인/실증/조달/허가 등)
-  * 책임 주체 불명확(권한-책임 불일치)
-  * 자원 집중 소모(예산·인력·시간이 새는 구간)
+def normalize(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").replace("\x00", " ")).strip()
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-## 3. STSI식 3단구조 작성 규칙
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-- □ 블록: 해당 절 전체를 포괄하는 전략적 선언문. 단순 현황 나열 금지. 반드시 의사결정 구조와 연결
-- ○ 논점: 상위 메시지의 핵심 쟁점·구조적 병목 분절. 병렬 구조 유지
-- * 설명: 정량 근거·사례·법적 맥락·정책 리스크 등 객관적 2~3줄 이상 서술
-- 각 섹션당 □ 블록 6개 이상, □당 ○ 3개 이상, ○당 * 3개 이상
+def clip(text: str, limit: int = 800) -> str:
+    text = normalize(text)
+    return text if len(text) <= limit else text[:limit].rstrip() + "..."
 
-### 필살기 4문장 패턴
-각 □ 블록 서술은 아래 4개 축을 모두 포함
-1. 본 과제의 핵심 병목은 A이며, 원인은 B임
-2. 따라서 해결전략은 C(제도)·D(기술)·E(산업) 3축으로 설계
-3. 성과는 F지표로 측정하며, 데이터는 G에서 확보
-4. 정책 실패 리스크 H를 방지하기 위해 I 거버넌스 설계
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-## 4. STSI 표준 목차 프레임
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-1) 구조 진단(Structure Diagnosis)
-2) 목표·전략체계(Strategy Architecture)
-3) 실행 설계(Implementation Design)
-4) 성과·평가체계(Impact)
-5) 수행방법론(Method & QA)
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-## 5. 6종 표준 도표
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-① 문제-목표-수단 트리
-② 이해관계자/기관 맵
-③ 로드맵 타임라인
-④ 거버넌스 구조도
-⑤ 예산·재정 구조
-⑥ TRL 매트릭스
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-## 6. 문체 규칙
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-- 명사형 종결
-- 서술형 종결 금지
-- 문장 말미 마침표 미사용
-- 단문 나열식 금지
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-## 7. 표·다이어그램 HTML 형식
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-표:
-<p class="table-title">표 N. 제목</p><table class="proposal-table"><thead><tr><th>컬럼1</th><th>컬럼2</th></tr></thead><tbody><tr><td>내용</td><td>내용</td></tr></tbody></table>
-
-다이어그램:
-<div class="diagram"><div class="diagram-row"><div class="diagram-box">내용</div><div class="diagram-arrow">→</div><div class="diagram-box highlight">강조</div></div></div>
-<p class="figure-title">그림 N. 제목</p>
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-## 8. 출처 표기 규칙
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-- □ 블록 1개당 출처 1개 이상
-- 허용: 정부·공공기관 보고서, 학술논문, 공식 통계, 주요 언론
-- 금지: 위키피디아, 블로그, 존재하지 않는 자료 임의 생성
-- 형식: <p class="citation">출처: 기관명(발행연도.월), 제목</p>
-- 위치: 해당 □ 블록 내용 바로 아래
-"""
-
-DEFAULT_SECTIONS = [
-    "1. 구조 진단(Structure Diagnosis)",
-    "2. 목표·전략체계(Strategy Architecture)",
-    "3. 실행 설계(Implementation Design)",
-    "4. 성과·평가체계(Impact)",
-    "5. 수행방법론(Method & QA)",
-]
-
-
-def get_api_key() -> str:
+def read_pdf(uploaded_file):
+    if uploaded_file is None:
+        return "", {}
     try:
-        value = st.secrets["ANTHROPIC_API_KEY"]
-        if value:
-            return str(value).strip()
-    except Exception:
-        pass
-    return os.getenv("ANTHROPIC_API_KEY", "").strip()
+        reader = PdfReader(BytesIO(uploaded_file.getvalue()))
+        text = []
+        for page in reader.pages[:40]:
+            try:
+                text.append(page.extract_text() or "")
+            except Exception:
+                pass
+        md = reader.metadata or {}
+        meta = {
+            "title": getattr(md, "title", None),
+            "author": getattr(md, "author", None),
+            "subject": getattr(md, "subject", None),
+        }
+        return normalize("\n".join(text)), meta
+    except Exception as e:
+        return "", {"error": str(e)}
 
-
-def anthropic_headers() -> Dict[str, str]:
-    api_key = get_api_key()
-    if not api_key:
-        raise RuntimeError("ANTHROPIC_API_KEY가 없습니다")
-    return {
-        "x-api-key": api_key,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
-    }
-
-
-def pdf_to_base64(file_bytes: bytes) -> str:
-    return base64.b64encode(file_bytes).decode("utf-8")
-
-
-def safe_decode_text(file_bytes: bytes) -> str:
-    for enc in ("utf-8", "cp949", "euc-kr", "utf-16"):
-        try:
-            return file_bytes.decode(enc)
-        except Exception:
+def tokenize(text: str):
+    words = re.findall(r"[A-Za-z가-힣0-9\-\+]{2,}", text or "")
+    result = []
+    for w in words:
+        w = w.lower().strip()
+        if w in STOPWORDS or w.isdigit():
             continue
-    return file_bytes.decode("utf-8", errors="ignore")
-
-
-def extract_marked_block(raw: str, marker: str, next_marker: Optional[str]) -> str:
-    start = raw.find(marker)
-    if start == -1:
-        return ""
-    content_start = start + len(marker)
-    end = raw.find(next_marker, content_start) if next_marker else -1
-    if end == -1:
-        end = len(raw)
-    return raw[content_start:end].strip()
-
-
-def parse_directions(raw: str) -> Dict[str, str]:
-    result = {}
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line or ": " not in line:
-            continue
-        key, value = line.split(": ", 1)
-        result[key.strip()] = value.strip()
+        result.append(w)
     return result
 
+def extract_keywords(text: str, fallback: str = "", limit: int = 10):
+    counter = Counter(tokenize(text))
+    items = [w for w, _ in counter.most_common(40)]
+    for w in tokenize(fallback):
+        if w not in items:
+            items.append(w)
+    final = []
+    for w in items:
+        if len(w) < 2:
+            continue
+        if w not in final:
+            final.append(w)
+    for w in ["정책수요","추진전략","성과관리","실행체계","확산가능성"]:
+        if len(final) >= limit:
+            break
+        if w not in final:
+            final.append(w)
+    return final[:limit]
 
-def make_uploaded_content(uploaded_file, instruction: str) -> List[Dict[str, Any]]:
-    name = uploaded_file.name.lower()
-    file_bytes = uploaded_file.getvalue()
+def detect_domain(text: str):
+    text = (text or "").lower()
+    best, score = "general", 0
+    for domain, hints in DOMAIN_HINTS.items():
+        s = sum(1 for h in hints if h in text)
+        if s > score:
+            best, score = domain, s
+    return best
 
-    if name.endswith(".pdf"):
-        return [
-            {
-                "type": "document",
-                "source": {
-                    "type": "base64",
-                    "media_type": "application/pdf",
-                    "data": pdf_to_base64(file_bytes),
-                },
-            },
-            {"type": "text", "text": instruction},
-        ]
+def build_payload(mode, rfp_file, rfp_text, extra1, extra2, extra_note):
+    if mode == "upload" and rfp_file is not None:
+        main_text, _ = read_pdf(rfp_file)
+        main_name = rfp_file.name
+        source_type = "pdf"
+    else:
+        main_text = normalize(rfp_text)
+        main_name = "직접 입력"
+        source_type = "text"
 
-    text = safe_decode_text(file_bytes)
-    return [
-        {"type": "text", "text": instruction + "\n\n---\n" + text[:15000]}
+    extra_files = []
+    for file_obj in [extra1, extra2]:
+        if file_obj is None:
+            continue
+        txt, meta = read_pdf(file_obj)
+        extra_files.append({"name": file_obj.name, "text": txt, "meta": meta})
+
+    combined = normalize("\n".join([main_text] + [x["text"] for x in extra_files] + [extra_note or ""]))
+    fallback = " ".join([main_name] + [x["name"] for x in extra_files] + [extra_note or ""])
+    keywords = extract_keywords(combined, fallback, 10)
+    return {
+        "source_type": source_type,
+        "rfp_name": main_name,
+        "rfp_text": main_text,
+        "extra_files": extra_files,
+        "extra_note": normalize(extra_note),
+        "combined": combined,
+        "preview": clip(combined),
+        "keywords": keywords,
+        "domain": detect_domain(combined + " " + fallback),
+        "text_extracted": bool(main_text),
+    }
+
+def make_analysis(payload):
+    k = payload["keywords"] + ["정책수요","실행체계","성과관리","확산전략"]
+    k1, k2, k3, k4 = k[:4]
+    focus = FOCUS.get(payload["domain"], FOCUS["general"])
+    extra_bits = []
+    if payload["extra_files"]:
+        extra_bits.append(f"추가 PDF {len(payload['extra_files'])}건")
+    if payload["extra_note"]:
+        extra_bits.append("직접 입력 참고 정보")
+    extra_phrase = ", ".join(extra_bits) if extra_bits else "RFP 본문"
+
+    intent = (
+        f"이 과제의 발주 의도는 {k1}·{k2}와 관련된 수요를 단순한 현황 정리 수준이 아니라 실행 가능한 전략으로 구조화하는 데 있습니다. "
+        f"발주기관은 배경 설명만 반복하는 보고서보다 실제 의사결정에 바로 사용할 수 있는 분석 틀과 우선순위, 실행 대안을 확보하려는 성격이 강합니다.\n\n"
+        f"왜 지금 이 과제가 필요한지의 관점에서 보면 핵심은 {focus}에 대한 대응을 더 미루기 어렵다는 점입니다. "
+        f"환경 변화 속도가 빨라질수록 정책·사업 설계 기준을 다시 세워야 하고, 그에 따라 추진 전략과 성과관리 체계가 함께 요구됩니다.\n\n"
+        f"이번 입력에서는 {extra_phrase}가 함께 제공되었기 때문에, 일반론적 제안보다 기관 상황과 축적된 맥락을 반영한 맞춤형 접근이 필요하다고 해석하는 것이 타당합니다. "
+        f"따라서 제안서는 RFP 문구를 반복하기보다 추가 자료에 나타난 조건과 제약을 본문 논리 안으로 흡수하는 방식으로 구성하는 편이 적절합니다.\n\n"
+        f"결론적으로 발주자는 {k3}와 {k4}를 연결하는 실무형 제안서를 기대한다고 볼 수 있습니다. "
+        f"즉, 분석의 깊이와 함께 실행 체계, 일정, 성과 활용 시나리오까지 한 번에 제시하는 문서가 높은 평가를 받을 가능성이 큽니다."
+    )
+
+    criteria = [
+        {"항목":"과업이해도 및 목표타당성","비중":"25%","핵심포인트":f"{k1}과 {k2}가 왜 핵심 문제인지 선명하게 재구성해야 합니다. 목표는 선언형 문구보다 문제정의-해결경로-산출물의 연결 구조로 제시하는 편이 유리합니다."},
+        {"항목":"연구방법 및 추진전략","비중":"25%","핵심포인트":f"{focus}를 구현할 수 있는 단계별 방법론을 제시해야 합니다. 조사·분석·실증·환류의 흐름을 끊김 없이 설계하고, 각 단계의 검증 기준을 분명히 적는 것이 중요합니다."},
+        {"항목":"추진체계 및 수행역량","비중":"20%","핵심포인트":"총괄-실무-자문 역할을 구분해 책임소재를 명확히 보여줘야 합니다. 추가 자료의 기존 실적이나 유사 경험이 있다면 정량 근거로 전환하는 구성이 효과적입니다."},
+        {"항목":"성과확산 및 활용가능성","비중":"20%","핵심포인트":f"{k3}가 실제 제도개선, 정책반영, 후속사업화로 이어지는 활용 시나리오를 제시해야 합니다. 결과물이 발주기관의 의사결정에 어떻게 직접 쓰일지까지 보여줘야 합니다."},
+        {"항목":"예산편성의 적정성","비중":"10%","핵심포인트":"인건비, 조사·분석비, 자문비를 산출물과 직접 연결해 설명해야 합니다. 비용 항목마다 왜 필요한지와 단계별 투입 논리를 함께 제시하면 설득력이 높아집니다."},
     ]
 
-
-def call_claude(
-    system: str,
-    messages: List[Dict[str, Any]],
-    max_tokens: int = 4000,
-    use_web_search: bool = False,
-    model: str = DEFAULT_MODEL,
-) -> Dict[str, Any]:
-    body: Dict[str, Any] = {
-        "model": model,
-        "max_tokens": max_tokens,
-        "system": system,
-        "messages": messages,
+    strategy = {
+        "전체방향": (
+            f"제안서 전체는 '{k1}를 둘러싼 문제를 {k2} 중심의 실행전략으로 해결한다'는 메시지로 묶는 편이 좋습니다. "
+            f"단순 현황정리보다 문제정의, 제약요인, 실행 시나리오, 활용 결과를 순차적으로 제시해야 설득력이 높아집니다.\n\n"
+            f"특히 추가 자료에 포함된 기관 실적과 특이사항은 별도 참고사항으로 두지 말고, 왜 우리 기관이 적합한가를 설명하는 증거 블록으로 재배치하는 구성이 유리합니다."
+        ),
+        "섹션별전략": [
+            {"섹션":"과업 이해 및 발주 배경","전략":f"{k1}과 {k2}를 중심으로 현재 상황의 문제를 구조화하고, 발주기관이 당장 해결하고자 하는 쟁점을 압축해 보여줘야 합니다."},
+            {"섹션":"추진 방법론 및 세부 수행내용","전략":"착수-진단-분석-전략수립-환류의 5단 흐름으로 설계하면 안정적입니다. 각 단계에서 사용할 데이터, 분석 프레임, 산출물을 구체적으로 적어야 합니다."},
+            {"섹션":"추진체계 및 역할분담","전략":"총괄책임자, 세부 실무책임자, 외부 자문단 기능을 구분해 역할 중복을 줄여야 합니다. 의사결정 체계와 품질관리 절차를 도식화하면 신뢰도가 높아집니다."},
+            {"섹션":"성과관리 및 활용계획","전략":f"{k3}와 {k4}를 중심으로 성과를 산출물 자체보다 정책 반영 가능성, 후속 사업 연계성, 기관 내 내재화 수준으로 정의하는 편이 적절합니다."},
+            {"섹션":"기관 경쟁력 및 차별화","전략":"보유 데이터, 유사 과제 경험, 정책 네트워크, 전문가 풀을 근거 중심으로 제시해야 합니다. 추가 자료의 기존 실적은 숫자와 사례 중심으로 재정리하는 편이 효과적입니다."},
+        ],
+        "차별화포인트": "1) 추가 자료를 별첨이 아니라 본문 근거로 직접 연결\n2) 연구방법을 단계별 검증 질문과 산출물 기준으로 제시\n3) 최종 결과물이 발주기관 내부 의사결정에 어떻게 쓰일지 활용 시나리오까지 명시",
     }
 
-    # 안정성을 위해 기본 웹 검색 도구 사용
-    if use_web_search:
-        body["tools"] = [
-            {
-                "type": "web_search_20250305",
-                "name": "web_search",
-                "max_uses": 5,
-            }
-        ]
+    qas = [
+        {"질문":"왜 이 과제가 지금 시점에 꼭 필요한가?","답변":f"본 과제는 {k1}를 둘러싼 수요가 누적된 상황에서 이를 실행전략으로 전환해야 하는 시점이라는 점에 의미가 있습니다. 제안서는 현황 설명보다 즉시 활용 가능한 정책 설계와 실행 근거 제시에 초점을 맞추고 있습니다."},
+        {"질문":"제안한 방법론이 실제로 작동할 것이라는 근거는 무엇인가?","답변":f"방법론을 자료수집-진단-분석-전략수립-환류의 단계로 구분하고 각 단계별 산출물을 명확히 설정했습니다. 따라서 {k2}를 추상적으로 설명하는 것이 아니라 중간 검증이 가능한 구조로 설계했다는 점이 강점입니다."},
+        {"질문":"귀 기관이 이 과제를 수행하기에 적합한 이유는 무엇인가?","답변":"RFP 외에 제공된 추가 자료의 기존 실적과 기관 특성을 제안 논리 안에 직접 반영할 수 있다는 점이 경쟁력입니다. 이를 통해 발주기관 관점의 이해도와 실제 수행 역량을 동시에 입증하는 구성이 가능합니다."},
+        {"질문":"최종 성과는 어떤 방식으로 활용될 수 있는가?","답변":f"최종 성과는 보고서 제출에 그치지 않고 발주기관의 내부 의사결정, 사업 설계, 후속과제 기획에 바로 활용될 수 있도록 설계했습니다. 특히 {k3}와 연계한 실행안, 우선순위, 관리지표까지 함께 제시하는 방향이 적절합니다."},
+        {"질문":"경쟁 제안서와 비교해 차별적인 부분은 무엇인가?","답변":"추가 자료를 단순 참고가 아니라 차별화 근거로 재구성한다는 점이 가장 큰 차이입니다. 또한 수행체계와 성과활용 계획을 한 세트로 설계해 실제 적용 가능성을 더 선명하게 보여줄 수 있습니다."},
+    ]
 
-    try:
-        response = requests.post(
-            API_URL,
-            headers=anthropic_headers(),
-            json=body,
-            timeout=300,
-        )
-    except requests.RequestException as e:
-        raise RuntimeError(f"네트워크 오류: {e}") from e
+    return {"발주의도": intent, "평가기준": criteria, "핵심키워드": payload["keywords"], "작성전략": strategy, "예상QA": qas}
 
-    if response.status_code >= 400:
-        try:
-            err = response.json()
-            raise RuntimeError(f"API 오류 {response.status_code}: {err}")
-        except Exception:
-            raise RuntimeError(f"API 오류 {response.status_code}: {response.text}")
+def make_refs():
+    return {"유사과제": [], "관련논문": []}
 
-    return response.json()
+def build_copy_text(result, refs):
+    t = "═══════════════════════════════════\n  RFP AI 분석 결과 (데모 모드)\n═══════════════════════════════════\n\n"
+    t += "【 발주 의도 】\n" + result.get("발주의도","") + "\n\n"
+    t += "【 평가 기준 】\n"
+    for i, item in enumerate(result.get("평가기준", []), 1):
+        t += f"{i}. {item['항목']} ({item['비중']})\n   → {item['핵심포인트']}\n"
+    t += "\n【 핵심 키워드 】\n" + "  ".join([f"#{i} {kw}" for i, kw in enumerate(result.get("핵심키워드", []), 1)]) + "\n\n"
+    t += "【 작성 전략 】\n▶ 전체 방향\n" + result.get("작성전략", {}).get("전체방향","") + "\n\n▶ 섹션별 전략\n"
+    for i, item in enumerate(result.get("작성전략", {}).get("섹션별전략", []), 1):
+        t += f"{i}. {item['섹션']}\n   {item['전략']}\n"
+    t += "\n▶ 차별화 포인트\n" + result.get("작성전략", {}).get("차별화포인트","") + "\n\n"
+    t += "【 예상 질문 & 답변 】\n"
+    for i, item in enumerate(result.get("예상QA", []), 1):
+        t += f"Q{i}. {item['질문']}\nA. {item['답변']}\n\n"
+    t += "【 유사 과제 】\n- 현재 데모 모드에서는 실제 검색을 수행하지 않습니다.\n\n"
+    t += "【 관련 논문 】\n- 현재 데모 모드에서는 실제 검색을 수행하지 않습니다.\n"
+    return t
 
-
-def call_claude_text(
-    system: str,
-    messages: List[Dict[str, Any]],
-    max_tokens: int = 4000,
-    use_web_search: bool = False,
-    model: str = DEFAULT_MODEL,
-) -> str:
-    current_messages = messages[:]
-
-    for _ in range(3):
-        data = call_claude(
-            system=system,
-            messages=current_messages,
-            max_tokens=max_tokens,
-            use_web_search=use_web_search,
-            model=model,
-        )
-
-        content = data.get("content", [])
-        text_parts = [
-            block.get("text", "")
-            for block in content
-            if block.get("type") == "text" and block.get("text")
-        ]
-        final_text = "\n".join(text_parts).strip()
-
-        if data.get("stop_reason") == "pause_turn":
-            current_messages = current_messages + [
-                {"role": "assistant", "content": content}
-            ]
-            continue
-
-        if final_text:
-            return final_text
-
-        raise RuntimeError("Claude 응답 텍스트가 비어 있습니다")
-
-    raise RuntimeError("응답이 pause_turn 상태로 반복되어 완료되지 않았습니다")
-
-
-def analyze_rfp(uploaded_file, use_web_search: bool) -> Dict[str, Any]:
-    instruction = """위 RFP 문서를 STSI 발주 의도 역설계 방식으로 분석하여 아래 형식으로 정확히 응답하세요.
-
-핵심 분석 관점:
-- "무엇을 하라는가?"(X) → "왜 지금 이 과제를 내는가? 발주자의 고민은 무엇인가?"(O)
-- 이 사업의 구조적 병목(bottleneck)은 무엇인가?
-- 어떤 정책 리스크가 존재하는가?
-
-##TITLE##
-(과제명을 한 줄로)
-
-##SUMMARY##
-(발주 의도 역설계 관점의 핵심 분석 300자 이내)
-
-##SECTIONS##
-(제안서 작성 목차 항목들, 한 줄에 하나씩. 없으면 STSI 표준 목차 사용)
-
-##DIRECTIONS##
-(목차 항목명): (발주 의도·병목·정책 리스크 관점에서의 작성 방향 2~3문장)
-"""
-
-    content = make_uploaded_content(uploaded_file, instruction)
-
-    raw = call_claude_text(
-        system="당신은 STSI 과제수주 전략 전문가입니다. 요청된 마커 형식으로만 응답하세요.",
-        messages=[{"role": "user", "content": content}],
-        max_tokens=4000,
-        use_web_search=use_web_search,
+def render_keywords(words):
+    html = "".join(
+        [f"<span class='chip' style='background:{TAG_COLORS[i % len(TAG_COLORS)]}'>#{i+1} {w}</span>" for i, w in enumerate(words)]
     )
+    st.markdown(html, unsafe_allow_html=True)
 
-    title = extract_marked_block(raw, "##TITLE##", "##SUMMARY##")
-    summary = extract_marked_block(raw, "##SUMMARY##", "##SECTIONS##")
-    sections_raw = extract_marked_block(raw, "##SECTIONS##", "##DIRECTIONS##")
-    directions_raw = extract_marked_block(raw, "##DIRECTIONS##", None)
+for key in ["analysis_result", "refs_result", "copy_text", "payload_preview"]:
+    if key not in st.session_state:
+        st.session_state[key] = None
 
-    sections = [s.strip() for s in sections_raw.splitlines() if s.strip()] or DEFAULT_SECTIONS
-    directions = parse_directions(directions_raw)
+st.markdown(
+    """
+    <div class="hero">
+      <span class="hero-badge">🔍 RFP_AI_1.0</span>
+      <h1 style="margin:14px 0 8px 0;color:#0f172a;">RFP AI 분석 도우미</h1>
+      <p style="margin:0;color:#475569;line-height:1.7;">
+        지금 버전은 Streamlit 웹 UI 데모입니다. RFP 업로드, 추가 자료 입력, 결과 화면, 다운로드 동선까지 먼저 구현하고,
+        Claude API와 웹 검색은 나중에 함수만 연결할 수 있게 분리해 둔 구조입니다.
+      </p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
-    result = {
-        "title": title.strip(),
-        "summary": summary.strip(),
-        "sections": sections,
-        "directions": directions,
-        "document_block": None,
-        "text_context": "",
-    }
-
-    if uploaded_file.name.lower().endswith(".pdf"):
-        result["document_block"] = content[0]
-    else:
-        joined_text = ""
-        if content and content[0].get("type") == "text":
-            joined_text = content[0].get("text", "")
-        result["text_context"] = joined_text[:15000]
-
-    return result
-
-
-def analyze_form(uploaded_file, use_web_search: bool) -> Dict[str, Any]:
-    instruction = """위 연구계획서 양식을 분석하여 아래 형식으로 정확히 응답하세요.
-
-##SUMMARY##
-(양식 구조 설명 100자 이내)
-
-##SECTIONS##
-(양식에 있는 작성 항목들, 한 줄에 하나씩)
-"""
-
-    content = make_uploaded_content(uploaded_file, instruction)
-
-    raw = call_claude_text(
-        system="연구계획서 양식 분석 전문가. 요청된 마커 형식으로만 응답하세요.",
-        messages=[{"role": "user", "content": content}],
-        max_tokens=2500,
-        use_web_search=use_web_search,
-    )
-
-    summary = extract_marked_block(raw, "##SUMMARY##", "##SECTIONS##")
-    sections_raw = extract_marked_block(raw, "##SECTIONS##", None)
-    sections = [s.strip() for s in sections_raw.splitlines() if s.strip()]
-
-    result = {
-        "summary": summary.strip(),
-        "sections": sections,
-        "document_block": None,
-        "text_context": "",
-    }
-
-    if uploaded_file.name.lower().endswith(".pdf"):
-        result["document_block"] = content[0]
-    else:
-        joined_text = ""
-        if content and content[0].get("type") == "text":
-            joined_text = content[0].get("text", "")
-        result["text_context"] = joined_text[:15000]
-
-    return result
-
-
-def generate_section(
-    section_name: str,
-    direction: str,
-    title: str,
-    rfp_summary: str,
-    section_list: List[str],
-    form_data: Optional[Dict[str, Any]],
-    rfp_data: Optional[Dict[str, Any]],
-    use_web_search: bool,
-) -> str:
-    volume_guide = """
-## 분량 기준
-- 이 섹션 단독으로 A4 기준 5페이지 이상 작성
-- □ 블록 6개 이상 작성
-- □ 블록 1개당 ○ 논점 3개 이상
-- ○ 논점 1개당 * 설명 3개 이상
-- □ 블록 1개당 출처 1개 이상
-- 절대 요약·생략하지 말고 최대한 구체적으로 서술
-"""
-
-    extra_context_parts = []
-
-    if rfp_data and rfp_data.get("text_context"):
-        extra_context_parts.append("## RFP 원문 일부\n" + rfp_data["text_context"])
-
-    if form_data and form_data.get("text_context"):
-        extra_context_parts.append("## 양식 원문 일부\n" + form_data["text_context"])
-
-    extra_context = "\n\n".join(extra_context_parts)
-
-    prompt = f"""
-## 과제 기본정보
-- 과제명: {title}
-
-## RFP 핵심 내용
-{rfp_summary}
-
-## 전체 목차
-{chr(10).join(section_list)}
-
-## 지금 작성할 섹션
-{section_name}
-
-작성 방향
-{direction or "RFP와 STSI 원칙에 따라 자동 판단"}
-
-{volume_guide}
-
-{extra_context}
-
-위 섹션만 작성하십시오.
-## 헤더로 시작하고 STSI 병목 중심 서술, 필살기 4문장, 6종 표준 도표, 명사형 종결 문체를 준수하십시오.
-"""
-
-    content_blocks: List[Dict[str, Any]] = []
-
-    if form_data and form_data.get("document_block"):
-        content_blocks.append(form_data["document_block"])
-
-    if rfp_data and rfp_data.get("document_block"):
-        content_blocks.append(rfp_data["document_block"])
-
-    content_blocks.append({"type": "text", "text": prompt})
-
-    return call_claude_text(
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": content_blocks}],
-        max_tokens=12000,
-        use_web_search=use_web_search,
-    )
-
-
-st.set_page_config(page_title="연구제안서 AI 작성 도우미", layout="wide")
-st.title("연구제안서 AI 작성 도우미")
-st.caption("RFP와 양식을 업로드하면 제안서 초안을 생성")
-
-if "rfp_data" not in st.session_state:
-    st.session_state.rfp_data = None
-if "form_data" not in st.session_state:
-    st.session_state.form_data = None
-if "generated_text" not in st.session_state:
-    st.session_state.generated_text = ""
-if "section_directions" not in st.session_state:
-    st.session_state.section_directions = {}
-
-api_key = get_api_key()
-api_ready = bool(api_key)
+st.info("현재는 데모 모드입니다. PDF 텍스트는 로컬에서 추출해 화면을 구성하고, 유사 과제·논문 검색은 비활성 상태로 둡니다.")
 
 with st.sidebar:
-    st.subheader("설정")
-    if api_ready:
-        st.success("API 키 확인 완료")
+    st.subheader("현재 상태")
+    st.success("웹 UI 완료")
+    st.warning("Claude API 미연결")
+    st.markdown("나중에 추가할 항목\n- Claude API 호출\n- 웹 검색 결과 파싱\n- `st.secrets` 연동")
+
+left, right = st.columns([1.15, 0.85], gap="large")
+
+with left:
+    st.header("입력")
+    tab_upload, tab_text = st.tabs(["📎 PDF 업로드", "✏️ 직접 입력"])
+
+    with tab_upload:
+        rfp_file = st.file_uploader("RFP PDF", type=["pdf"], key="rfp_file")
+    with tab_text:
+        rfp_text = st.text_area("RFP 내용 직접 입력", height=240, key="rfp_text")
+
+    with st.expander("선택 입력 · 추가 자료", expanded=True):
+        col1, col2 = st.columns(2)
+        with col1:
+            extra_file_1 = st.file_uploader("추가 PDF 1", type=["pdf"], key="extra_file_1")
+        with col2:
+            extra_file_2 = st.file_uploader("추가 PDF 2", type=["pdf"], key="extra_file_2")
+        extra_note = st.text_area(
+            "직접 입력 참고 정보",
+            height=140,
+            key="extra_note",
+            placeholder="기관 기존 실적, 특이사항, 경쟁기관 정보, 발주처 특성 등을 입력하세요.",
+        )
+
+    input_mode = "upload" if rfp_file is not None else "text"
+
+    if st.button("🔍 RFP 분석 시작", use_container_width=True, type="primary"):
+        if rfp_file is None and not (rfp_text or "").strip():
+            st.error("RFP PDF를 업로드하거나 RFP 내용을 직접 입력해야 합니다.")
+        else:
+            progress = st.progress(0)
+            status = st.empty()
+
+            status.info("입력 자료를 정리하는 중입니다...")
+            progress.progress(25)
+            payload = build_payload(input_mode, rfp_file if input_mode == "upload" else None, rfp_text, extra_file_1, extra_file_2, extra_note)
+
+            status.info("데모 분석 결과를 생성하는 중입니다...")
+            progress.progress(65)
+            result = make_analysis(payload)
+            refs = make_refs()
+
+            status.info("결과 화면을 구성하는 중입니다...")
+            progress.progress(90)
+            st.session_state.analysis_result = result
+            st.session_state.refs_result = refs
+            st.session_state.copy_text = build_copy_text(result, refs)
+            st.session_state.payload_preview = payload
+
+            progress.progress(100)
+            status.success("완료되었습니다. 아래 결과를 확인하세요.")
+
+with right:
+    st.header("입력 요약")
+    preview = st.session_state.payload_preview
+    if preview is None:
+        st.caption("아직 분석을 실행하지 않았습니다.")
+        st.markdown("- RFP는 PDF 업로드 또는 직접 입력 중 하나만 있으면 됩니다.\n- 추가 PDF 2건과 직접 입력 메모를 함께 넣을 수 있습니다.\n- 현재는 웹 UI 데모이므로 참고자료 검색은 비활성입니다.")
     else:
-        st.warning("API 키 없음")
-        st.caption("앱 화면은 열리지만 분석·생성 기능은 동작하지 않음")
-        st.caption("Streamlit Cloud의 App settings > Secrets에 ANTHROPIC_API_KEY를 추가하면 사용 가능")
+        st.markdown(f"<div class='soft'><b>RFP 입력 방식</b>: {preview['source_type']}<br><b>RFP 이름</b>: {preview['rfp_name']}<br><b>추가 파일 수</b>: {len(preview['extra_files'])}건<br><b>직접 입력 참고 정보</b>: {'있음' if preview['extra_note'] else '없음'}</div>", unsafe_allow_html=True)
+        st.markdown("#### 추출 미리보기")
+        if preview["preview"]:
+            st.write(preview["preview"])
+        else:
+            st.warning("PDF에서 텍스트를 추출하지 못했습니다. 스캔 PDF라면 현재 데모 모드에서는 내용 인식이 제한될 수 있습니다.")
+        if preview["extra_files"]:
+            st.markdown("#### 추가 파일")
+            for item in preview["extra_files"]:
+                st.markdown(f"- {item['name']}")
 
-    use_web_search = st.checkbox(
-        "웹 검색 사용",
-        value=False,
-        help="추가 비용이 발생할 수 있으며, Anthropic Console에서 웹 검색이 활성화되어 있어야 함",
-    )
+result = st.session_state.analysis_result
+refs = st.session_state.refs_result
 
-    if st.button("초기화"):
-        st.session_state.rfp_data = None
-        st.session_state.form_data = None
-        st.session_state.generated_text = ""
-        st.session_state.section_directions = {}
-        st.rerun()
+if result:
+    st.markdown("---")
+    st.header("결과")
+    st.warning("아래 결과는 Claude API 없이 동작하는 데모 초안입니다. 실제 분석·검색 로직은 나중에 함수만 교체하면 됩니다.")
 
-if not api_ready:
-    st.info("현재는 화면만 열리는 상태입니다. API 키를 넣기 전까지 분석·생성 버튼은 비활성화됩니다.")
+    st.subheader("🎯 발주 의도")
+    st.write(result["발주의도"])
 
-col1, col2 = st.columns(2)
+    st.subheader("📊 평가기준")
+    for item in result["평가기준"]:
+        st.markdown(f"**{item['항목']}** · {item['비중']}\n\n- {item['핵심포인트']}")
 
-with col1:
-    rfp_file = st.file_uploader("① RFP / 공모 문서", type=["pdf", "txt"], key="rfp")
-    if st.button("RFP 분석", disabled=(not api_ready or rfp_file is None)):
-        with st.spinner("RFP 분석 중"):
-            try:
-                st.session_state.rfp_data = analyze_rfp(rfp_file, use_web_search=use_web_search)
-                st.session_state.generated_text = ""
-                st.success("RFP 분석 완료")
-            except Exception as e:
-                st.error(f"RFP 분석 오류: {e}")
+    st.subheader("🏷️ 핵심키워드")
+    render_keywords(result["핵심키워드"])
 
-with col2:
-    form_file = st.file_uploader("② 연구계획서 양식", type=["pdf", "txt"], key="form")
-    if st.button("양식 분석", disabled=(not api_ready or form_file is None)):
-        with st.spinner("양식 분석 중"):
-            try:
-                st.session_state.form_data = analyze_form(form_file, use_web_search=use_web_search)
-                st.session_state.generated_text = ""
-                st.success("양식 분석 완료")
-            except Exception as e:
-                st.error(f"양식 분석 오류: {e}")
+    st.subheader("✍️ 작성전략")
+    strategy = result["작성전략"]
+    st.markdown(f"<div class='soft'>{strategy['전체방향'].replace(chr(10), '<br>')}</div>", unsafe_allow_html=True)
+    st.markdown("**섹션별 전략**")
+    for i, item in enumerate(strategy["섹션별전략"], 1):
+        with st.expander(f"{i}. {item['섹션']}", expanded=(i == 1)):
+            st.write(item["전략"])
+    st.markdown("**차별화포인트**")
+    st.markdown(f"<div class='warn'>{strategy['차별화포인트'].replace(chr(10), '<br>')}</div>", unsafe_allow_html=True)
 
-rfp_data = st.session_state.rfp_data
-form_data = st.session_state.form_data
+    st.subheader("💬 예상 질문 & 답변")
+    for i, item in enumerate(result["예상QA"], 1):
+        with st.expander(f"Q{i}. {item['질문']}", expanded=(i == 1)):
+            st.write(item["답변"])
 
-title_default = ""
-if rfp_data and rfp_data.get("title"):
-    title_default = rfp_data["title"]
+    st.subheader("📚 참고자료 · 유사과제 & 관련논문")
+    st.info("현재는 Claude API와 웹 검색이 연결되지 않아 참고자료를 비워 둡니다.")
 
-title = st.text_input("과제명", value=title_default)
+    st.subheader("📥 결과 저장")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.download_button("텍스트 결과 다운로드", data=st.session_state.copy_text, file_name="rfp_ai_demo_result.txt", mime="text/plain", use_container_width=True)
+    with c2:
+        st.download_button("JSON 결과 다운로드", data=json.dumps(result, ensure_ascii=False, indent=2), file_name="rfp_ai_demo_result.json", mime="application/json", use_container_width=True)
 
-if rfp_data and rfp_data.get("summary"):
-    st.info(f"RFP 요약: {rfp_data['summary']}")
-
-default_sections = DEFAULT_SECTIONS
-if form_data and form_data.get("sections"):
-    default_sections = form_data["sections"]
-elif rfp_data and rfp_data.get("sections"):
-    default_sections = rfp_data["sections"]
-
-sections_text = st.text_area(
-    "목차 항목",
-    value="\n".join(default_sections),
-    height=180
-)
-section_list = [s.strip() for s in sections_text.splitlines() if s.strip()]
-
-st.subheader("목차별 방향성")
-section_directions = {}
-for sec in section_list:
-    default_dir = ""
-    if rfp_data and sec in rfp_data.get("directions", {}):
-        default_dir = rfp_data["directions"][sec]
-    section_directions[sec] = st.text_area(
-        sec,
-        value=default_dir,
-        height=80,
-        key=f"dir_{sec}"
-    )
-
-generate_disabled = (not api_ready) or (not title.strip()) or (len(section_list) == 0)
-
-if st.button("제안서 생성", type="primary", disabled=generate_disabled):
-    full_text = ""
-    progress = st.progress(0)
-    status = st.empty()
-
-    for idx, sec in enumerate(section_list, start=1):
-        status.write(f"[{idx}/{len(section_list)}] {sec} 생성 중")
-        try:
-            part = generate_section(
-                section_name=sec,
-                direction=section_directions.get(sec, ""),
-                title=title,
-                rfp_summary=rfp_data["summary"] if rfp_data else "",
-                section_list=section_list,
-                form_data=form_data,
-                rfp_data=rfp_data,
-                use_web_search=use_web_search,
-            )
-            full_text += ("\n\n" if full_text else "") + part
-            st.session_state.generated_text = full_text
-            progress.progress(idx / len(section_list))
-        except Exception as e:
-            st.error(f"{sec} 생성 오류: {e}")
-            break
-
-    status.write("완료")
-
-if st.session_state.generated_text:
-    st.subheader("생성 결과")
-    st.text_area(
-        "결과 텍스트",
-        value=st.session_state.generated_text,
-        height=600
-    )
-    st.download_button(
-        label="TXT 다운로드",
-        data=st.session_state.generated_text.encode("utf-8"),
-        file_name="proposal_output.txt",
-        mime="text/plain",
-    )
+    with st.expander("복사용 텍스트 보기"):
+        st.text_area("복사용 텍스트", value=st.session_state.copy_text, height=320, disabled=True, label_visibility="collapsed")
